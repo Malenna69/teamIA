@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 EcoSwitch — Team IA Orchestrator (Streamlit)
-Version corrigée (2025-08-22)
+Version full intégrée (2025-08-22)
 
-Correctifs inclus:
-1) Décideur auto: clamp de l'index + fallback heuristique pour éviter IndexError.
-2) UI Orchestrateur: appel du décideur protégé par try/except + affichage conditionnel.
-3) Mode Chat: sélection correcte du provider du juge (gpt/grok/gemini vs heuristic),
-   au lieu de passer "llm" directement.
-4) RAG: extraction PDF robuste, build index tolérant, erreurs affichées via st.exception.
+Inclus :
+- Correctif IndexError du décideur (clamp + fallback heuristique)
+- Décideur : critères toujours visibles + option “Forcer le #1 du juge”
+- RAG robuste (PDF tolérant, build index safe, erreurs affichées)
+- Auto-routing du département (Orchestrateur & Chat)
+- Calibrateur de prompt par département (Orchestrateur & Chat)
+- Sélection correcte du juge (gpt/grok/gemini vs heuristic)
 """
 
-import os, json, time, asyncio, re, io, datetime
+import os, json, time, asyncio, re, io, datetime, unicodedata
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Any
 
@@ -56,6 +57,12 @@ def _trim(text: str, limit: int = MAX_CHARS) -> str:
 
 def _now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _norm(s: str) -> str:
+    s = s or ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower()
 
 @dataclass
 class ProviderResult:
@@ -149,6 +156,79 @@ def _apply_department(preset_key: str, system_txt: str, temp_val: float, debate_
     temp = cfg.get("temp", temp_val)
     debate = cfg.get("debate", debate_val)
     return weights, system, temp, debate
+
+# ========================= Auto-routing Département & Prompt Calibrator =========================
+def auto_route_department(prompt: str) -> str:
+    """Heuristique simple pour choisir un département selon le contenu du prompt (accent-insensible)."""
+    p = _norm(prompt)
+    scores = {k: 0 for k in DEPARTMENTS.keys()}
+    def add(keys, dep):
+        for k in keys:
+            if k in p: scores[dep] += 1
+    add(["wireframe","ux","ui","maquette","prototype","design","accessibil","wcag","landing","figma"], "ux-ui")
+    add(["prix","pricing","mrr","arr","roi","ltv","cac","cohorte","finance","tarif","monetisation","monétisation"], "finance")
+    add(["marketing","seo","ads","campagne","lead","newsletter","growth","copy","acquisition","roas"], "marketing")
+    add(["vente","sales","crm","pipeline","prospect","onboarding","closing"], "sales")
+    add(["thermique","hvac","re2020","batiment","kwh","u-value","isolation","rt2012"], "thermie-batiment")
+    add(["iot","firmware","capteur","mqtt","lora","edge","esp32","hardware"], "ingenierie")
+    add(["rgpd","gdpr","contrat","compliance","legal","juridique","privacy","donnees personnelles","donnees-personnelles"], "legal")
+    add(["deploiement","kubernetes","docker","slo","sla","monitoring","securite","cloud","prod","sre"], "operations")
+    add(["esg","carbone","co2","empreinte","lca","durable","sustainability","impact"], "sustainability")
+    add(["roadmap","mvp","user story","epic","backlog","rice","product","priorisation"], "product")
+    add(["code","bug","api","refactor","tests","react","python","typescript","tailwind","html","css","frontend","backend","script"], "coding")
+    best = max(scores.items(), key=lambda kv: kv[1])
+    return best[0] if best[1] > 0 else "general"
+
+def build_calibrated_prompt(raw_prompt: str, dep_key: str, rag_ctx: str = "") -> str:
+    """Construit un prompt structuré, adapté au département (avec variantes coding front/back)."""
+    p = _norm(raw_prompt)
+    base = [
+        f"RÔLE: {DEPARTMENTS.get(dep_key, {}).get('label','Général')} d'EcoSwitch.",
+        "OBJECTIF: Fournir une réponse précise, actionnable et mesurable.",
+        f"SUJET UTILISATEUR: {raw_prompt.strip()}",
+    ]
+    if rag_ctx:
+        base.append("CONTEXTE (extraits pertinents):\n" + _trim(rag_ctx, 2000))
+
+    extra: List[str]
+    if dep_key == "coding":
+        is_front = any(k in p for k in ["html","css","react","tailwind","frontend","ui","web","landing"])
+        if is_front:
+            extra = [
+                "CONTRAINTES TECHNIQUES: Code propre, modulaire, testable; pas de dépendances inutiles.",
+                "ACCESSIBILITÉ & PERF: Respect WCAG 2.1 AA, responsive, lazy-loading, budget bundle minimal.",
+                "LIVRABLE: Fournir le code complet (un seul fichier si possible), prêt à coller, sans blabla.",
+            ]
+        else:
+            extra = [
+                "CONTRAINTES TECHNIQUES: Code propre, modulaire, testable (unit tests) ; gestion des erreurs robuste.",
+                "PERF & SÉCURITÉ: Complexité maîtrisée, logs utiles, pas de secrets en dur.",
+                "LIVRABLE: Script/Module complet + exemples d'utilisation; sans blabla.",
+            ]
+    elif dep_key == "ux-ui":
+        extra = [
+            "CONTRAINTES: WCAG 2.1 AA, navigation clavier, hiérarchie claire, micro-interactions sobres.",
+            "LIVRABLE: Wireframe textuel + microcopie + checklist d’accessibilité + règles de responsive.",
+        ]
+    elif dep_key == "marketing":
+        extra = [
+            "CONTRAINTES: ICP, proposition de valeur, canaux, messages, UTM, KPI (CPL, CAC, ROAS).",
+            "LIVRABLE: Plan 90 jours, calendrier éditorial, messages par canal, 5 hooks A/B, KPI mesurables.",
+        ]
+    elif dep_key == "product":
+        extra = [
+            "CONTRAINTES: RICE, user stories INVEST, métriques North Star, risques, dépendances.",
+            "LIVRABLE: Mini-PRD: objectifs, users, stories, critères d’acceptation, risques, métriques.",
+        ]
+    else:
+        extra = ["LIVRABLE: Plan d’action numéroté + éléments concrets + risques + métriques de succès."]
+
+    tail = [
+        "STYLE: Clair, concis, structuré en sections, éviter le jargon inutile.",
+        "FORMAT DE SORTIE: Titres clairs et listes numérotées; inclure 'Risques & Mesures'.",
+        "LANGUE: Français.",
+    ]
+    return "\n\n".join(base + extra + tail)
 
 # ========================= Providers (sync + retries) =========================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), reraise=True)
@@ -423,8 +503,6 @@ def _chunk_text(txt: str, size: int = 1200, overlap: int = 200) -> List[str]:
         if start >= n: break
     return chunks
 
-# PATCH: extraction PDF robuste
-
 def _pdf_to_text(file_bytes: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
@@ -446,7 +524,6 @@ def _pdf_to_text(file_bytes: bytes) -> str:
     except Exception:
         return ""
 
-
 def _ext_to_text(filename: str, data: bytes) -> str:
     name = (filename or "").lower()
     if name.endswith(".pdf"):
@@ -456,13 +533,10 @@ def _ext_to_text(filename: str, data: bytes) -> str:
     except Exception:
         return ""
 
-
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     if a is None or b is None: return -1.0
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1e-9
     return float(np.dot(a, b) / denom)
-
-# PATCH: build KB tolérant
 
 def build_kb_from_files(files: List[Any]) -> List[Dict[str, Any]]:
     texts = []
@@ -479,7 +553,6 @@ def build_kb_from_files(files: List[Any]) -> List[Dict[str, Any]]:
                 texts.append({"source": f.name, "text": ch})
     return texts
 
-
 def embed_texts(texts: List[str]) -> List[List[float]]:
     api_key = _get_key("OPENAI_API_KEY")
     if not api_key:
@@ -487,7 +560,6 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     client = OpenAI(api_key=api_key, timeout=TIMEOUT_S)
     resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
     return [d.embedding for d in resp.data]
-
 
 def search_kb(q: str, kb: List[Dict[str,Any]], topk: int = RAG_TOPK) -> str:
     if not kb: return ""
@@ -539,7 +611,6 @@ async def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_cri
             "}"
             f"\n\n{data_blob}"
         )
-        # Utilise Grok pour la fermeté JSON, sinon GPT
         res = await ask_grok_xai_async(prompt, "Agent expert: objectif, concis, JSON only.", "grok-4", 0.4)
         if not res.ok or not res.output:
             res = await ask_openai_gpt_async(prompt, "Return only JSON.", "gpt-4o-mini", 0.2)
@@ -591,7 +662,7 @@ async def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_cri
             "risks": {"global": 0.35, "notes": "Dépend des données d'entrée et intégrations techniques."}
         }
 
-    # 5) Enrichir avec infos choix (avec garde anti-hors-bornes)
+    # 5) Enrichir avec infos choix (garde anti-hors-bornes)
     n = len(entries)
     try:
         idx = int(synth.get("choix_idx", 0))
@@ -599,7 +670,6 @@ async def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_cri
         idx = 0
 
     if not (0 <= idx < n):
-        # Fallback heuristique si l'index proposé est invalide
         scores = [heuristic_scores(e["output"]) for e in entries]
         totals = [(_total_score(s, weights), i) for i, s in enumerate(scores)]
         totals.sort(reverse=True)
@@ -666,14 +736,11 @@ def make_markdown_report(prompt: str, system: str, dep_key: str, weights: Dict[s
 
     return "\n".join(md)
 
-
 def make_html_from_markdown(md: str) -> str:
-    # Conversion simple (sans lib) : on wrappe le MD dans <pre> pour un rendu quick & propre
-    # Pour un vrai rendu MD→HTML, ajoutez markdown2/markdown, mais on reste sans dépendance ici.
     safe = md.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
     return f"""<!doctype html>
-<html lang=\"fr\"><head>
-<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<html lang="fr"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Rapport EcoSwitch</title>
 <style>
 body{{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 32px;}}
@@ -710,6 +777,12 @@ with st.sidebar:
     dep_options = {k:v["label"] for k,v in DEPARTMENTS.items()}
     dep_key = st.selectbox("Sélection", options=list(dep_options.keys()), format_func=lambda k: dep_options[k], index=0, key="dep_sel")
 
+    # Routage & Calibrage (sidebar)
+    st.checkbox("Auto-département (selon prompt)", value=False, key="auto_dep")
+    st.checkbox("Activer calibrage de prompt (Orchestrateur)", value=False, key="prompt_calib")
+    st.checkbox("Auto-département (Chat)", value=False, key="auto_dep_chat")
+    st.checkbox("Calibrage de prompt (Chat)", value=False, key="prompt_calib_chat")
+
     st.subheader("Fournisseurs actifs")
     colp1, colp2, colp3 = st.columns(3)
     with colp1: use_gpt    = st.checkbox("GPT",    value=True, key="prov_gpt")
@@ -729,6 +802,10 @@ with st.sidebar:
     judge_kind     = st.selectbox("Type", ["llm","heuristic"], index=0, key="j_kind")
     judge_provider = st.selectbox("Fournisseur (si llm)", ["gpt","grok","gemini"], index=0, key="j_prov")
     judge_model    = st.text_input("Modèle juge (optionnel)", "", key="j_model")
+
+    st.subheader("Décideur")
+    st.text_input("🎛️ Critères décideur", st.session_state.get("dec_crit_orch", "Prioriser faisabilité, coût bas et impact éco haut"), key="dec_crit_orch")
+    st.checkbox("Forcer le #1 du juge", value=False, key="force_top")
 
     st.divider()
     st.subheader("📚 Docs (RAG) — optionnel")
@@ -757,16 +834,19 @@ if mode == "Orchestrateur":
     system_default = "Tu es un comité d'experts (ingénierie, UX, marché). Style: clair, structuré, actionnable."
     system = st.text_input("🗣️ System prompt (optionnel)", value=system_default, key="ti_system")
 
+    # Auto-sélection de département selon le prompt (si activé)
+    if st.session_state.get("auto_dep", False) and (st.session_state.get("ta_prompt") or "").strip():
+        try:
+            dep_key = auto_route_department(st.session_state.get("ta_prompt", ""))
+            st.info(f"Département auto sélectionné : {DEPARTMENTS[dep_key]['label']}")
+        except Exception:
+            pass
+
     # Applique preset
     weights, system_applied, temp_applied, debate_applied = _apply_department(dep_key, system, temp, debate_rounds)
     system = system_applied
     temp   = temp_applied
     debate_rounds = debate_applied
-
-    # Décideur - critères (toujours visible)
-    st.subheader("Décideur")
-    st.text_input("🎛️ Critères décideur", st.session_state.get("dec_crit_orch", "Prioriser faisabilité, coût bas et impact éco haut"), key="dec_crit_orch")
-
 
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
@@ -787,7 +867,11 @@ if mode == "Orchestrateur":
             try: rag_ctx = search_kb(prompt, st.session_state["kb"], topk=RAG_TOPK)
             except Exception as e: st.warning(f"RAG désactivé (erreur): {e}")
 
-        full_prompt = prompt if not rag_ctx else f"{prompt}\n\n[Contexte documents]\n{_trim(rag_ctx, 3500)}"
+        # Prompt à envoyer (calibré ou brut)
+        if st.session_state.get("prompt_calib", False):
+            full_prompt = build_calibrated_prompt(prompt, dep_key, rag_ctx=rag_ctx)
+        else:
+            full_prompt = prompt if not rag_ctx else f"{prompt}\n\n[Contexte documents]\n{_trim(rag_ctx, 3500)}"
 
         with st.spinner("Appels LLM en parallèle…"):
             async def run_all():
@@ -833,13 +917,38 @@ if mode == "Orchestrateur":
             st.warning(f"Juge LLM indisponible ({e}). Fallback heuristique.")
             scoreboard = judge_with_provider(prompt, entries, "heuristic", None, weights)
 
-        # Décideur auto (protégé)
-        criteria = st.session_state.get("dec_crit_orch", "Prioriser faisabilité, coût bas et impact éco haut")
-        try:
-            decision = asyncio.run(decideur_auto(entries, weights, criteria, project_ctx=_trim(rag_ctx, 1500)))
-        except Exception as e:
-            st.warning(f"Décideur auto indisponible : {e}")
-            decision = None
+        # (Option) Forcer le #1 du juge
+        forced_decision = None
+        if st.session_state.get("force_top", False):
+            rows = []
+            for s in scoreboard.get("scores", []):
+                rows.append({"provider": s["provider"], "total": round(_total_score(s, weights), 2)})
+            if rows:
+                top_provider = sorted(rows, key=lambda r: r["total"], reverse=True)[0]["provider"]
+                top_entry = next((e for e in entries if e["provider"] == top_provider), entries[0])
+                idx = entries.index(top_entry)
+                forced_decision = {
+                    "choix_idx": idx,
+                    "choix_provider": top_entry["provider"],
+                    "choix_model": top_entry["model"],
+                    "choix_excerpt": _trim(top_entry["output"], 600),
+                    "explication": "Choix forcé : #1 du juge.",
+                    "plan": [],
+                    "alternatives": [e["provider"] for e in entries if e is not top_entry],
+                    "risks": {"global": None, "notes": "Forçage utilisateur."}
+                }
+
+        # Décideur auto (protégé) – ignoré si forçage activé
+        decision = None
+        if forced_decision:
+            decision = forced_decision
+        else:
+            criteria = st.session_state.get("dec_crit_orch", "Prioriser faisabilité, coût bas et impact éco haut")
+            try:
+                decision = asyncio.run(decideur_auto(entries, weights, criteria, project_ctx=_trim(rag_ctx, 1500)))
+            except Exception as e:
+                st.warning(f"Décideur auto indisponible : {e}")
+                decision = None
 
         st.success("Terminé ! ✅")
 
@@ -935,7 +1044,8 @@ if mode == "Chat":
     st.subheader("💬 Chat multi-LLM (avec RAG)")
     chat_system_default = "Tu es une équipe IA d'EcoSwitch. Réponds de manière concise, structurée, actionnable."
     chat_system = st.text_input("System (chat)", value=chat_system_default, key="chat_sys")
-    weights, chat_system, temp, _ = _apply_department(st.session_state.get("dep_sel","general"), chat_system, st.session_state.get("p_temp",0.6), 0)
+    # preset initial (sera réappliqué après auto-route éventuel)
+    weights, chat_system, temp_chat, _ = _apply_department(st.session_state.get("dep_sel","general"), chat_system, st.session_state.get("p_temp",0.6), 0)
 
     # Affiche l'historique
     for msg in st.session_state["chat"]:
@@ -945,14 +1055,13 @@ if mode == "Chat":
     # Entrée
     user_msg = st.chat_input("Écris un message…")
     if user_msg:
-        # Affiche immédiatement le message user
         st.session_state["chat"].append({"role":"user", "content": user_msg})
         with st.chat_message("user"):
             st.markdown(user_msg)
 
-        # Construit contexte conversation + RAG
+        # Contexte convo + RAG
         history_txt = []
-        for m in st.session_state["chat"][-6:]:  # on prend les 6 derniers
+        for m in st.session_state["chat"][-6:]:
             role = "Utilisateur" if m["role"]=="user" else "Assistant"
             history_txt.append(f"{role}: {m['content']}")
         convo = "\n".join(history_txt)
@@ -964,21 +1073,32 @@ if mode == "Chat":
             except Exception:
                 rag_ctx = ""
 
-        chat_prompt = (
-            f"{convo}\n\nMessage actuel:\n{user_msg}\n\n"
-            + (f"[Contexte docs]\n{_trim(rag_ctx, 2500)}\n\n" if rag_ctx else "")
-            + "Réponds à l'utilisateur en intégrant le contexte si pertinent."
-        )
+        # Auto-département (Chat) & preset
+        dep_key_chat = st.session_state.get("dep_sel","general")
+        if st.session_state.get("auto_dep_chat", False):
+            dep_key_chat = auto_route_department(user_msg)
+            st.caption(f"Département auto (chat) : {DEPARTMENTS[dep_key_chat]['label']}")
+        weights, chat_system, temp_chat, _ = _apply_department(dep_key_chat, chat_system, st.session_state.get("p_temp",0.6), 0)
+
+        # Calibrage éventuel du prompt de chat
+        if st.session_state.get("prompt_calib_chat", False):
+            chat_prompt = build_calibrated_prompt(user_msg, dep_key_chat, rag_ctx=rag_ctx)
+        else:
+            chat_prompt = (
+                f"{convo}\n\nMessage actuel:\n{user_msg}\n\n"
+                + (f"[Contexte docs]\n{_trim(rag_ctx, 2500)}\n\n" if rag_ctx else "")
+                + "Réponds à l'utilisateur en intégrant le contexte si pertinent."
+            )
 
         # Appels providers en parallèle
         async def chat_call():
             tasks = []
             if st.session_state.get("prov_gpt", True):
-                tasks.append(ask_openai_gpt_async(chat_prompt, chat_system, st.session_state.get("m_gpt","gpt-4o-mini"), temp))
+                tasks.append(ask_openai_gpt_async(chat_prompt, chat_system, st.session_state.get("m_gpt","gpt-4o-mini"), temp_chat))
             if st.session_state.get("prov_grok", True):
-                tasks.append(ask_grok_xai_async(chat_prompt, chat_system, st.session_state.get("m_grok","grok-4"), temp))
+                tasks.append(ask_grok_xai_async(chat_prompt, chat_system, st.session_state.get("m_grok","grok-4"), temp_chat))
             if st.session_state.get("prov_gemini", True):
-                tasks.append(ask_gemini_async(chat_prompt, chat_system, st.session_state.get("m_gem","gemini-2.5-flash"), temp))
+                tasks.append(ask_gemini_async(chat_prompt, chat_system, st.session_state.get("m_gem","gemini-2.5-flash"), temp_chat))
             results = await asyncio.gather(*tasks) if tasks else []
             entries = [{
                 "provider": r.provider, "model": r.model, "latency_s": r.latency_s,
@@ -990,49 +1110,47 @@ if mode == "Chat":
         if not entries:
             bot_reply = "Aucune réponse valide — vérifie les clés API ou les modèles."
         else:
-            # Juge et synthèse courte : on choisit le top et on répond avec son texte
+            # Juge et sélection du top
+            provider_for_judge_chat = judge_provider if judge_kind == "llm" else "heuristic"
             try:
-                kind = st.session_state.get("j_kind","llm")
-                prov = st.session_state.get("j_prov","gpt") if kind == "llm" else "heuristic"
-                scoreboard = judge_with_provider(user_msg, entries, prov, st.session_state.get("j_model","") or None, weights)
+                scoreboard = judge_with_provider(user_msg, entries, provider_for_judge_chat, judge_model or None, weights)
             except Exception:
                 scoreboard = judge_with_provider(user_msg, entries, "heuristic", None, weights)
 
-            # tri
             rows = []
             for s in scoreboard.get("scores", []):
                 total = round(_total_score(s, weights), 2)
-                rows.append({"provider":s["provider"], "total": total})
+                rows.append({"provider": s["provider"], "total": total})
             top_provider = None
             if rows:
                 top_provider = sorted(rows, key=lambda r:r["total"], reverse=True)[0]["provider"]
             chosen = next((e for e in entries if e["provider"] == top_provider), entries[0])
             bot_reply = chosen["output"]
 
-            # Option: petite synthèse en 2 lignes (gpt)
-            syn_prompt = (
-                "Synthétise en 2 phrases maximum la meilleure réponse pour l'utilisateur, "
-                "sans préambule, ton concret et actionnable.\n\n" + bot_reply
-            )
-            syn = ask_openai_gpt(syn_prompt, "Return concise answer.", st.session_state.get("m_gpt","gpt-4o-mini"), 0.2)
-            if syn.ok and syn.output:
-                bot_reply = syn.output
+            # Synthèse 2 lignes (optionnelle) — uniquement si GPT actif + clé dispo
+            if st.session_state.get("prov_gpt", True) and (_get_key("OPENAI_API_KEY") or ""):
+                syn_prompt = (
+                    "Synthétise en 2 phrases maximum la meilleure réponse pour l'utilisateur, "
+                    "sans préambule, ton concret et actionnable.\n\n" + bot_reply
+                )
+                syn = ask_openai_gpt(syn_prompt, "Return concise answer.", st.session_state.get("m_gpt","gpt-4o-mini"), 0.2)
+                if syn.ok and syn.output:
+                    bot_reply = syn.output
 
-        # Affiche et ajoute à l'historique
         with st.chat_message("assistant"):
             st.markdown(bot_reply)
-            with st.expander("Voir les réponses par modèle"):
-                for e in entries or []:
-                    st.caption(f"{e['provider'].upper()} • {e['model']} • {e['latency_s']:.2f}s")
-                    st.text_area("Sortie", value=e["output"], height=180, key=f"chat_out_{time.time()}_{e['provider']}")
+            if entries:
+                with st.expander("Voir les réponses par modèle"):
+                    for e in entries:
+                        st.caption(f"{e['provider'].upper()} • {e['model']} • {e['latency_s']:.2f}s")
+                        st.text_area("Sortie", value=e["output"], height=180, key=f"chat_out_{time.time()}_{e['provider']}")
 
         st.session_state["chat"].append({"role":"assistant", "content": bot_reply})
 
-    # Outils d’export du chat
+    # Exports chat
     if st.session_state["chat"]:
         chat_json = json.dumps(st.session_state["chat"], ensure_ascii=False, indent=2)
         st.download_button("⬇️ Export Chat (JSON)", data=chat_json, file_name="chat_history.json", mime="application/json", key="dl_chat_json")
-        # MD simple du chat
         lines = [f"# Chat {APP_NAME}\n_Généré le {_now_str()}_\n"]
         for m in st.session_state["chat"]:
             role = "Utilisateur" if m["role"]=="user" else "Assistant"
