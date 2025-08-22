@@ -763,6 +763,11 @@ if mode == "Orchestrateur":
     temp   = temp_applied
     debate_rounds = debate_applied
 
+    # Décideur - critères (toujours visible)
+    st.subheader("Décideur")
+    st.text_input("🎛️ Critères décideur", st.session_state.get("dec_crit_orch", "Prioriser faisabilité, coût bas et impact éco haut"), key="dec_crit_orch")
+
+
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
         run_btn = st.button("🚀 Lancer", use_container_width=True, key="run_btn_orch")
@@ -829,7 +834,7 @@ if mode == "Orchestrateur":
             scoreboard = judge_with_provider(prompt, entries, "heuristic", None, weights)
 
         # Décideur auto (protégé)
-        criteria = st.text_input("🎛️ Critères décideur", "Prioriser faisabilité, coût bas et impact éco haut", key="dec_crit_orch")
+        criteria = st.session_state.get("dec_crit_orch", "Prioriser faisabilité, coût bas et impact éco haut")
         try:
             decision = asyncio.run(decideur_auto(entries, weights, criteria, project_ctx=_trim(rag_ctx, 1500)))
         except Exception as e:
