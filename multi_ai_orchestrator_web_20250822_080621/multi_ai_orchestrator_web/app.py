@@ -1,4 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+EcoSwitch — Team IA Orchestrator (Streamlit)
+Version corrigée (2025-08-22)
+
+Correctifs inclus:
+1) Décideur auto: clamp de l'index + fallback heuristique pour éviter IndexError.
+2) UI Orchestrateur: appel du décideur protégé par try/except + affichage conditionnel.
+3) Mode Chat: sélection correcte du provider du juge (gpt/grok/gemini vs heuristic),
+   au lieu de passer "llm" directement.
+4) RAG: extraction PDF robuste, build index tolérant, erreurs affichées via st.exception.
+"""
+
 import os, json, time, asyncio, re, io, datetime
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Any
@@ -342,10 +354,10 @@ def role_system(base: Optional[str]) -> str:
 
 def prompt_for_round(task: str, self_name: str, drafts: Dict[str, str], round_idx: int) -> str:
     others = {k:v for k,v in drafts.items() if k != self_name}
-    def trim(txt: str, limit=4000): return txt[:limit]
+    def _t(txt: str, limit=4000): return txt[:limit]
     blocks = [f"Task:\n{task}\n", f"Round: {round_idx}\n"]
     for name, draft in others.items():
-        blocks.append(f"=== {name.upper()} CURRENT DRAFT ===\n{trim(draft)}\n")
+        blocks.append(f"=== {name.upper()} CURRENT DRAFT ===\n{_t(draft)}\n")
     blocks.append(
         "Instructions:\n"
         "- Provide CRITIQUE (succinct, concrete) on gaps, errors, structure.\n"
@@ -411,15 +423,29 @@ def _chunk_text(txt: str, size: int = 1200, overlap: int = 200) -> List[str]:
         if start >= n: break
     return chunks
 
+# PATCH: extraction PDF robuste
+
 def _pdf_to_text(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    out = []
-    for page in reader.pages:
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
         try:
-            out.append(page.extract_text() or "")
+            if getattr(reader, "is_encrypted", False):
+                try:
+                    reader.decrypt("")
+                except Exception:
+                    return ""
         except Exception:
-            pass
-    return "\n".join(out)
+            return ""
+        out = []
+        for page in reader.pages:
+            try:
+                out.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
 
 def _ext_to_text(filename: str, data: bytes) -> str:
     name = (filename or "").lower()
@@ -430,19 +456,29 @@ def _ext_to_text(filename: str, data: bytes) -> str:
     except Exception:
         return ""
 
+
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     if a is None or b is None: return -1.0
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) or 1e-9
     return float(np.dot(a, b) / denom)
 
+# PATCH: build KB tolérant
+
 def build_kb_from_files(files: List[Any]) -> List[Dict[str, Any]]:
     texts = []
     for f in files or []:
-        data = f.getvalue()
-        txt = _ext_to_text(f.name, data)
+        try:
+            data = f.getvalue()
+            txt = _ext_to_text(f.name, data)
+        except Exception:
+            txt = ""
+        if not (txt or "").strip():
+            continue
         for ch in _chunk_text(txt):
-            texts.append({"source": f.name, "text": ch})
+            if ch.strip():
+                texts.append({"source": f.name, "text": ch})
     return texts
+
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     api_key = _get_key("OPENAI_API_KEY")
@@ -451,6 +487,7 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     client = OpenAI(api_key=api_key, timeout=TIMEOUT_S)
     resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
     return [d.embedding for d in resp.data]
+
 
 def search_kb(q: str, kb: List[Dict[str,Any]], topk: int = RAG_TOPK) -> str:
     if not kb: return ""
@@ -481,6 +518,7 @@ async def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_cri
     # 2) Agents spécialisés (prompts)
     focuses = ["Technique/Faisabilité", "Business/ROI", "Écologie/ESG"]
     agents = []
+
     async def run_agent(focus: str):
         prompt = (
             f"{base_ctx}\nRôle: Expert {focus}.\n"
@@ -521,7 +559,7 @@ async def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_cri
             return {}
 
     agent_parsed = [_safe_json(t) for t in agent_jsons if t]
-    synth = {}
+    synth: Dict[str, Any] = {}
     for loop in range(max_loops):
         prompt = (
             "Tu es l'orchestrateur final. Fusionne les avis agents en une décision claire.\n"
@@ -539,9 +577,8 @@ async def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_cri
         if synth.get("choix_idx") is not None:
             break
 
-    # 4) Fallback heuristique si besoin
+    # 4) Fallback heuristique si besoin (aucun choix proposé)
     if synth.get("choix_idx") is None:
-        # Score heuristique + poids
         scores = [heuristic_scores(e["output"]) for e in entries]
         totals = [(_total_score(s, weights), i) for i,s in enumerate(scores)]
         totals.sort(reverse=True)
@@ -554,8 +591,22 @@ async def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_cri
             "risks": {"global": 0.35, "notes": "Dépend des données d'entrée et intégrations techniques."}
         }
 
-    # 5) Enrichir avec infos choix
-    idx = int(synth["choix_idx"])
+    # 5) Enrichir avec infos choix (avec garde anti-hors-bornes)
+    n = len(entries)
+    try:
+        idx = int(synth.get("choix_idx", 0))
+    except Exception:
+        idx = 0
+
+    if not (0 <= idx < n):
+        # Fallback heuristique si l'index proposé est invalide
+        scores = [heuristic_scores(e["output"]) for e in entries]
+        totals = [(_total_score(s, weights), i) for i, s in enumerate(scores)]
+        totals.sort(reverse=True)
+        idx = totals[0][1] if totals else 0
+        synth["explication"] = (synth.get("explication","") + " (idx hors bornes → fallback heuristique)").strip()
+
+    synth["choix_idx"] = idx
     synth["choix_provider"] = entries[idx]["provider"]
     synth["choix_model"] = entries[idx]["model"]
     synth["choix_excerpt"] = _trim(entries[idx]["output"], 600)
@@ -615,13 +666,14 @@ def make_markdown_report(prompt: str, system: str, dep_key: str, weights: Dict[s
 
     return "\n".join(md)
 
+
 def make_html_from_markdown(md: str) -> str:
     # Conversion simple (sans lib) : on wrappe le MD dans <pre> pour un rendu quick & propre
     # Pour un vrai rendu MD→HTML, ajoutez markdown2/markdown, mais on reste sans dépendance ici.
     safe = md.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
     return f"""<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang=\"fr\"><head>
+<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <title>Rapport EcoSwitch</title>
 <style>
 body{{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 32px;}}
@@ -674,9 +726,9 @@ with st.sidebar:
     debate_rounds = st.number_input("Débat — tours", min_value=0, max_value=5, value=0, step=1, key="p_debate")
 
     st.subheader("Juge")
-    judge_kind    = st.selectbox("Type", ["llm","heuristic"], index=0, key="j_kind")
-    judge_provider= st.selectbox("Fournisseur (si llm)", ["gpt","grok","gemini"], index=0, key="j_prov")
-    judge_model   = st.text_input("Modèle juge (optionnel)", "", key="j_model")
+    judge_kind     = st.selectbox("Type", ["llm","heuristic"], index=0, key="j_kind")
+    judge_provider = st.selectbox("Fournisseur (si llm)", ["gpt","grok","gemini"], index=0, key="j_prov")
+    judge_model    = st.text_input("Modèle juge (optionnel)", "", key="j_model")
 
     st.divider()
     st.subheader("📚 Docs (RAG) — optionnel")
@@ -685,18 +737,19 @@ with st.sidebar:
     uploaded = st.file_uploader("Ajouter des fichiers .pdf / .txt / .md", type=["pdf","txt","md"], accept_multiple_files=True, key="rag_files")
     if st.button("Construire / Mettre à jour l’index", key="rag_build"):
         with st.spinner("Index RAG en construction…"):
-            kb_texts = build_kb_from_files(uploaded or [])
-            if not kb_texts:
-                st.warning("Aucun texte extrait.")
-            else:
-                try:
+            try:
+                kb_texts = build_kb_from_files(uploaded or [])
+                kb_texts = [k for k in kb_texts if (k.get("text") or "").strip()]
+                if not kb_texts:
+                    st.warning("Aucun texte exploitable (PDF chiffré/corrompu ? Essayez un .txt).")
+                else:
                     embeds = embed_texts([k["text"] for k in kb_texts])
                     for i, emb in enumerate(embeds):
                         kb_texts[i]["embedding"] = emb
                     st.session_state["kb"] = kb_texts
                     st.success(f"Index prêt ({len(kb_texts)} passages).")
-                except Exception as e:
-                    st.error(f"RAG: échec embeddings — {e}")
+            except Exception as e:
+                st.exception(e)
 
 # ========================= MODE ORCHESTRATEUR =========================
 if mode == "Orchestrateur":
@@ -775,9 +828,13 @@ if mode == "Orchestrateur":
             st.warning(f"Juge LLM indisponible ({e}). Fallback heuristique.")
             scoreboard = judge_with_provider(prompt, entries, "heuristic", None, weights)
 
-        # Décideur auto
+        # Décideur auto (protégé)
         criteria = st.text_input("🎛️ Critères décideur", "Prioriser faisabilité, coût bas et impact éco haut", key="dec_crit_orch")
-        decision = asyncio.run(decideur_auto(entries, weights, criteria, project_ctx=_trim(rag_ctx, 1500)))
+        try:
+            decision = asyncio.run(decideur_auto(entries, weights, criteria, project_ctx=_trim(rag_ctx, 1500)))
+        except Exception as e:
+            st.warning(f"Décideur auto indisponible : {e}")
+            decision = None
 
         st.success("Terminé ! ✅")
 
@@ -806,19 +863,22 @@ if mode == "Orchestrateur":
             st.write(scoreboard.get("action_plan","(n/a)"))
 
         with tabs[len(entries)+1]:
-            st.write(f"**Choix :** {decision.get('choix_provider')} ({decision.get('choix_model')})")
-            st.write("**Explication :**", decision.get("explication",""))
-            st.write("**Risques (global)** :", decision.get("risks",{}).get("global"))
-            if decision.get("plan"):
-                st.write("**Plan proposé**")
-                for i, step in enumerate(decision["plan"], 1):
-                    st.write(f"{i}. {step}")
-            if decision.get("alternatives"):
-                st.write("**Alternatives**")
-                for alt in decision["alternatives"]:
-                    st.write(f"- {alt}")
-            with st.expander("Extrait du choix"):
-                st.code(decision.get("choix_excerpt",""))
+            if not decision:
+                st.info("Décideur non disponible pour cette exécution.")
+            else:
+                st.write(f"**Choix :** {decision.get('choix_provider')} ({decision.get('choix_model')})")
+                st.write("**Explication :**", decision.get("explication",""))
+                st.write("**Risques (global)** :", decision.get("risks",{}).get("global"))
+                if decision.get("plan"):
+                    st.write("**Plan proposé**")
+                    for i, step in enumerate(decision["plan"], 1):
+                        st.write(f"{i}. {step}")
+                if decision.get("alternatives"):
+                    st.write("**Alternatives**")
+                    for alt in decision["alternatives"]:
+                        st.write(f"- {alt}")
+                with st.expander("Extrait du choix"):
+                    st.code(decision.get("choix_excerpt",""))
 
         if transcript:
             with tabs[-1]:
@@ -886,7 +946,6 @@ if mode == "Chat":
             st.markdown(user_msg)
 
         # Construit contexte conversation + RAG
-        # Convo simplifiée concaténée (pour rester compatible avec nos appels single-turn)
         history_txt = []
         for m in st.session_state["chat"][-6:]:  # on prend les 6 derniers
             role = "Utilisateur" if m["role"]=="user" else "Assistant"
@@ -928,10 +987,9 @@ if mode == "Chat":
         else:
             # Juge et synthèse courte : on choisit le top et on répond avec son texte
             try:
-                scoreboard = judge_with_provider(user_msg, entries,
-                                                 st.session_state.get("j_kind","llm"),
-                                                 st.session_state.get("j_model","") or None,
-                                                 weights)
+                kind = st.session_state.get("j_kind","llm")
+                prov = st.session_state.get("j_prov","gpt") if kind == "llm" else "heuristic"
+                scoreboard = judge_with_provider(user_msg, entries, prov, st.session_state.get("j_model","") or None, weights)
             except Exception:
                 scoreboard = judge_with_provider(user_msg, entries, "heuristic", None, weights)
 
