@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
-# ======================= Team IA – ECOSWITCH (Web) ============================
-# Presets Départements • Mémoire Projet • RAG • Débat multi-IA • Juge • Exports
-# Evite les erreurs Streamlit (DuplicateElementId) grâce aux keys stables.
-
-import os, json, time, re, datetime, math
+# =================== Team IA – ECOSWITCH (Web) — v2 optimisée ==================
+# + Presets Départements (12)
+# + Mémoire Projet & RAG (fallback sans embeddings si indisponible)
+# + Débat multi-IA (GPT/Grok/Gemini) avec barre de progression
+# + Juge (heuristique/LLM) et exports JSON/MD/HTML
+# + Parallélisation des appels IA (ThreadPoolExecutor)
+# + Keys Streamlit stables (pas de DuplicateElementId)
+# ------------------------------------------------------------------------------
+import os, json, time, re, datetime, math, random
 import streamlit as st
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ------------------------------ Config page -----------------------------------
 st.set_page_config(page_title="Team IA – ECOSWITCH", layout="wide")
 
 # =============================== Providers ====================================
@@ -39,6 +43,10 @@ def _get_temp(default_str: str, ui_value: Optional[float]) -> float:
     except Exception:
         return float(default_str)
 
+def normalize_weights(r, u, c, k):
+    total = max(1e-9, (r + u + c + k))
+    return {"rigor": r/total, "usefulness": u/total, "creativity": c/total, "risk": k/total}
+
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 # ---------------------------- Provider calls ----------------------------------
@@ -51,6 +59,18 @@ class ProviderResult:
     ok: bool
     error: Optional[str] = None
 
+def _retry_call(fn, attempts=2, first_delay=0.8, backoff=1.7):
+    last_e = None
+    delay = first_delay
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_e = e
+            time.sleep(delay + random.uniform(0, 0.3))
+            delay *= backoff
+    raise last_e
+
 def ask_openai_gpt(prompt: str, system: Optional[str], model: str, temp: Optional[float]) -> ProviderResult:
     api_key = _get_key("OPENAI_API_KEY")
     if not api_key:
@@ -58,14 +78,16 @@ def ask_openai_gpt(prompt: str, system: Optional[str], model: str, temp: Optiona
     client = OpenAI(api_key=api_key, timeout=TIMEOUT_S)
     t0 = time.time()
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role":"system","content": system or "You are a rigorous, neutral assistant."},
-                {"role":"user","content": prompt}
-            ],
-            temperature=_get_temp("0.7", temp)
-        )
+        def _call():
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role":"system","content": system or "You are a rigorous, neutral assistant."},
+                    {"role":"user","content": prompt}
+                ],
+                temperature=_get_temp("0.7", temp)
+            )
+        resp = _retry_call(_call, attempts=2)
         txt = resp.choices[0].message.content.strip()
         return ProviderResult("gpt", model, txt, time.time()-t0, True)
     except Exception as e:
@@ -78,14 +100,16 @@ def ask_grok_xai(prompt: str, system: Optional[str], model: str, temp: Optional[
     client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1", timeout=TIMEOUT_S)
     t0 = time.time()
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role":"system","content": system or "Be precise, insightful and practical."},
-                {"role":"user","content": prompt}
-            ],
-            temperature=_get_temp("0.8", temp)
-        )
+        def _call():
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role":"system","content": system or "Be precise, insightful and practical."},
+                    {"role":"user","content": prompt}
+                ],
+                temperature=_get_temp("0.8", temp)
+            )
+        resp = _retry_call(_call, attempts=2)
         txt = resp.choices[0].message.content.strip()
         return ProviderResult("grok", model, txt, time.time()-t0, True)
     except Exception as e:
@@ -95,22 +119,27 @@ def ask_gemini(prompt: str, system: Optional[str], model: str, temp: Optional[fl
     api_key = _get_key("GOOGLE_API_KEY")
     if not api_key:
         return ProviderResult("gemini", model, "", 0.0, False, "GOOGLE_API_KEY manquant")
-    client = genai.Client(api_key=api_key)
     t0 = time.time()
     try:
+        client = genai.Client(api_key=api_key)
         cfg = genai_types.GenerateContentConfig(
             system_instruction=system or "You are a clear, structured, neutral expert.",
             temperature=_get_temp("0.6", temp),
         )
-        res = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=cfg
-        )
+        def _call():
+            return client.models.generate_content(model=model, contents=prompt, config=cfg)
+        res = _retry_call(_call, attempts=2)
         txt = (res.text or "").strip()
         return ProviderResult("gemini", model, txt, time.time()-t0, True)
     except Exception as e:
-        return ProviderResult("gemini", model, "", time.time()-t0, False, str(e))
+        # Fallback (au cas où le SDK change)
+        try:
+            client = genai.Client(api_key=api_key)
+            res = client.models.generate_content(model=model, contents=prompt)
+            txt = (res.text or "").strip()
+            return ProviderResult("gemini", model, txt, time.time()-t0, True)
+        except Exception as e2:
+            return ProviderResult("gemini", model, "", time.time()-t0, False, f"{e} / {e2}")
 
 # ===================== Heuristic scoring & utilities ==========================
 def heuristic_scores(text: str):
@@ -135,10 +164,6 @@ def compute_total(s, weights):
             weights["usefulness"] * s["usefulness"] +
             weights["creativity"] * s["creativity"] +
             weights["risk"] * (10 - s["risk"]))
-
-def normalize_weights(r, u, c, k):
-    total = max(1e-9, (r + u + c + k))
-    return {"rigor": r/total, "usefulness": u/total, "creativity": c/total, "risk": k/total}
 
 # ================================ Judge =======================================
 def judge_with_provider(task: str, entries: list, provider: str, judge_model: Optional[str], weights: Dict[str,float]):
@@ -233,7 +258,7 @@ def prompt_for_round(task: str, self_name: str, drafts: Dict[str, str], round_id
 def run_debate(task: str, system: Optional[str], rounds: int, style: str, max_chars: int,
                use_gpt: bool, use_grok: bool, use_gemini: bool,
                gpt_model: str, grok_model: str, gemini_model: str,
-               temp: Optional[float]):
+               temp: Optional[float], progress_cb=None):
     participants = []
     if use_gpt: participants.append(("gpt", ask_openai_gpt, gpt_model))
     if use_grok: participants.append(("grok", ask_grok_xai, grok_model))
@@ -242,12 +267,17 @@ def run_debate(task: str, system: Optional[str], rounds: int, style: str, max_ch
     drafts: Dict[str,str] = {}
     transcript: List[Dict] = []
 
+    total_steps = (rounds + 1) * max(1, len(participants))
+    done = 0
+
     # Round 0: initial drafts
     for name, fn, model in participants:
         r = fn(task, role_system(system, style), model, temp)
         text = r.output if r.ok else f"[ERROR] {r.error}"
         drafts[name] = text
         transcript.append({"round": 0, "speaker": name, "model": model, "text": text})
+        done += 1
+        if progress_cb: progress_cb(done / total_steps)
 
     # Debate rounds
     for rd in range(1, rounds+1):
@@ -263,6 +293,8 @@ def run_debate(task: str, system: Optional[str], rounds: int, style: str, max_ch
                 rev = text[idx+9:].strip()
             new_drafts[name] = rev or text
             transcript.append({"round": rd, "speaker": name, "model": model, "text": text})
+            done += 1
+            if progress_cb: progress_cb(done / total_steps)
         drafts = new_drafts
     return drafts, transcript
 
@@ -309,20 +341,39 @@ def cosine_sim(a: List[float], b: List[float]) -> float:
     if na == 0 or nb == 0: return 0.0
     return s/(na*nb)
 
+def _keyword_fallback(query: str, chunks: List[str], meta: List[str], top_k: int) -> Tuple[str, List[Tuple[float,int]]]:
+    terms = [w for w in re.findall(r"[a-zA-ZÀ-ÿ0-9]+", query.lower()) if len(w) > 2]
+    scores = []
+    for idx, ch in enumerate(chunks):
+        txt = ch.lower()
+        score = sum(txt.count(t) for t in terms)
+        if "ecoswitch" in txt: score += 1  # petit boost contextuel
+        scores.append((score, idx))
+    scores.sort(key=lambda x: x[0], reverse=True)
+    picks = [(float(s), i) for s,i in scores[:top_k]]
+    extracts = []
+    for _, idx in picks:
+        src = meta[idx]
+        extracts.append(f"[{src}] {chunks[idx]}")
+    return "\n\n".join(extracts), picks
+
 def build_rag_context(query: str, kb_store: Dict, top_k: int = 5) -> Tuple[str, List[Tuple[float,int]]]:
     if not kb_store or not kb_store.get("chunks"): return "", []
-    qv = embed_texts([query])[0]
-    sims = []
-    for idx, vec in enumerate(kb_store["embeddings"]):
-        sims.append((cosine_sim(qv, vec), idx))
-    sims.sort(key=lambda x: x[0], reverse=True)
-    picks = sims[:top_k]
-    extracts = []
-    for score, idx in picks:
-        src = kb_store["meta"][idx]
-        extracts.append(f"[{src}] {kb_store['chunks'][idx]}")
-    ctx = "\n\n".join(extracts)
-    return ctx, picks
+    try:
+        qv = embed_texts([query])[0]
+        sims = []
+        for idx, vec in enumerate(kb_store["embeddings"]):
+            sims.append((cosine_sim(qv, vec), idx))
+        sims.sort(key=lambda x: x[0], reverse=True)
+        picks = sims[:top_k]
+        extracts = []
+        for score, idx in picks:
+            src = kb_store["meta"][idx]
+            extracts.append(f"[{src}] {kb_store['chunks'][idx]}")
+        return "\n\n".join(extracts), picks
+    except Exception:
+        # Fallback simple mots-clés si embeddings indisponibles
+        return _keyword_fallback(query, kb_store["chunks"], kb_store["meta"], top_k)
 
 # ============================ Reports (MD / HTML) =============================
 def build_markdown_report(prompt: str, system: str, entries: list, scoreboard: dict,
@@ -342,7 +393,7 @@ def build_markdown_report(prompt: str, system: str, entries: list, scoreboard: d
     if kb_info:
         lines.append("## 📚 Connaissances (RAG)\n")
         lines.append(f"- Fichiers: {', '.join(kb_info.get('files', [])) or '(aucun)'}")
-        lines.append(f"- Chunks: {kb_info.get('chunks_count', 0)}  •  Modèle d'embedding: text-embedding-3-small\n")
+        lines.append(f"- Chunks: {kb_info.get('chunks_count', 0)}  •  Modèle d'embedding: text-embedding-3-small (ou fallback mots-clés)\n")
     lines.append("## 📊 Scores\n")
     rows = []
     for s in scoreboard.get("scores", []):
@@ -399,6 +450,7 @@ for k, v in {
     "judge_kind": "llm", "judge_provider": "gpt", "judge_model": "",
     "w_rigor": 40, "w_use": 30, "w_crea": 20, "w_risk": 10,
     "inject_mem": True, "use_rag": False, "rag_k": 5,
+    "prev_dept": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -545,10 +597,8 @@ with st.sidebar:
     m["objectives"]  = st.text_area("Objectifs (OKR)", m["objectives"], height=60, key="mem_obj")
     m["constraints"] = st.text_area("Contraintes (tech/brand/legal)", m["constraints"], height=60, key="mem_cons")
     st.session_state["inject_mem"] = st.checkbox("Injecter la mémoire dans chaque tâche", value=st.session_state["inject_mem"], key="inject_mem_cb")
-
     st.download_button("⬇️ Exporter la mémoire (.json)", data=json.dumps(m, ensure_ascii=False, indent=2),
                        file_name="ecoswitch_memory.json", mime="application/json", key="dl_mem")
-
     mem_upload = st.file_uploader("Charger mémoire (.json)", type=["json"], key="up_mem")
     if mem_upload:
         try:
@@ -573,7 +623,8 @@ with st.sidebar:
             st.session_state["kb_store"] = {"chunks": raw_texts, "embeddings": vecs, "meta": metas, "files": file_names}
             st.success(f"Indexé: {len(raw_texts)} passages depuis {len(file_names)} fichier(s).")
         except Exception as e:
-            st.error(f"Embeddings échoués: {e}")
+            st.warning(f"Embeddings indisponibles → fallback mots-clés. Détail: {e}")
+            st.session_state["kb_store"] = {"chunks": raw_texts, "embeddings": [], "meta": metas, "files": file_names}
 
     st.session_state["use_rag"] = st.checkbox("Activer RAG (utiliser les docs)", value=st.session_state["use_rag"], key="use_rag_cb")
     st.session_state["rag_k"]  = st.slider("Nb d'extraits (top-K)", 1, 10, st.session_state["rag_k"], key="rag_k_sl")
@@ -582,11 +633,12 @@ with st.sidebar:
     dept_keys = list(DEPARTMENTS.keys())
     dept_labels = [DEPARTMENTS[k]["label"] for k in dept_keys]
     sel_idx = st.selectbox("Choisis un département", list(range(len(dept_labels))), format_func=lambda i: dept_labels[i], index=0, key="dept_select")
-    if st.button("Appliquer le preset", key="apply_dept"):
+    # Auto-apply preset si changement
+    if st.session_state["prev_dept"] != sel_idx:
         chosen_key = dept_keys[sel_idx]
         _apply_department(chosen_key)
-        st.success(f"Preset « {DEPARTMENTS[chosen_key]['label']} » appliqué.")
-        st.rerun()
+        st.session_state["prev_dept"] = sel_idx
+        st.toast(f"Preset « {DEPARTMENTS[chosen_key]['label']} » appliqué.", icon="✅")
 
     st.header("5) ⚙️ Paramètres IA")
     st.session_state["use_gpt"]    = st.checkbox("GPT (OpenAI)", value=st.session_state["use_gpt"], key="use_gpt_cb")
@@ -637,12 +689,13 @@ col_pb1, col_pb2, col_pb3 = st.columns([2,2,1])
 with col_pb1:
     pb_name = st.selectbox("Choisis un playbook", list(PLAYBOOKS.keys()), index=0, key="pb_sel")
 with col_pb2:
-    step_idx = st.number_input("Étape", 1, 2, 1, 1, key="pb_step")
+    feature_name = st.text_input("Variable {feature}", "optimisation des pics de consommation (peak shaving)", key="pb_feature")
 with col_pb3:
-    if st.button("Charger l’étape", key="pb_load"):
-        template = PLAYBOOKS[pb_name][int(step_idx)-1]
-        template = template.replace("{feature}", "optimisation des pics de consommation (peak shaving)")
-        st.session_state["prompt"] = template
+    step_idx = st.number_input("Étape", 1, 2, 1, 1, key="pb_step")
+
+if st.button("Charger l’étape", key="pb_load"):
+    template = PLAYBOOKS[pb_name][int(step_idx)-1]
+    st.session_state["prompt"] = template.replace("{feature}", feature_name)
 
 # ------------------------------- Prompt zone ----------------------------------
 prompt = st.text_area("🧠 Prompt", height=160, key="prompt", placeholder="Décris la tâche ECOSWITCH…")
@@ -659,20 +712,7 @@ if clear_btn:
     st.session_state["system"] = "Tu es un comité d'experts (ingénierie, UX, marché). Style: clair, structuré, actionnable."
     st.stop()
 
-# ------------------------------- Execution ------------------------------------
-entries = []; scoreboard = {}; transcript = None
-meta = {
-    "gpt_model": st.session_state["gpt_model"],
-    "grok_model": st.session_state["grok_model"],
-    "gemini_model": st.session_state["gemini_model"],
-    "active": [p for p,flag in (("gpt",st.session_state["use_gpt"]),("grok",st.session_state["use_grok"]),("gemini",st.session_state["use_gemini"])) if flag],
-    "temp": st.session_state["temperature"],
-    "debate_rounds": st.session_state["debate_rounds"],
-    "debate_style": st.session_state["debate_style"],
-    "max_chars": st.session_state["max_chars"]
-}
-weights = normalize_weights(st.session_state["w_rigor"], st.session_state["w_use"], st.session_state["w_crea"], st.session_state["w_risk"])
-
+# -------------------------- Assemble prompt (mémoire/RAG) ---------------------
 def assemble_task_prompt(user_prompt: str) -> str:
     blocks = []
     if st.session_state["inject_mem"]:
@@ -690,6 +730,40 @@ def assemble_task_prompt(user_prompt: str) -> str:
     blocks.append("### TÂCHE\n" + (user_prompt or ""))
     return "\n\n".join([b for b in blocks if b.strip()])
 
+# ------------------------------- Execution ------------------------------------
+entries = []; scoreboard = {}; transcript = None
+meta = {
+    "gpt_model": st.session_state["gpt_model"],
+    "grok_model": st.session_state["grok_model"],
+    "gemini_model": st.session_state["gemini_model"],
+    "active": [p for p,flag in (("gpt",st.session_state["use_gpt"]),("grok",st.session_state["use_grok"]),("gemini",st.session_state["use_gemini"])) if flag],
+    "temp": st.session_state["temperature"],
+    "debate_rounds": st.session_state["debate_rounds"],
+    "debate_style": st.session_state["debate_style"],
+    "max_chars": st.session_state["max_chars"]
+}
+weights = normalize_weights(st.session_state["w_rigor"], st.session_state["w_use"], st.session_state["w_crea"], st.session_state["w_risk"])
+
+def _run_selected_providers(prompt_final: str, system: str):
+    calls = []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = []
+        if st.session_state["use_gpt"]:
+            futs.append(ex.submit(ask_openai_gpt, prompt_final, system, st.session_state["gpt_model"], st.session_state["temperature"]))
+        if st.session_state["use_grok"]:
+            futs.append(ex.submit(ask_grok_xai, prompt_final, system, st.session_state["grok_model"], st.session_state["temperature"]))
+        if st.session_state["use_gemini"]:
+            futs.append(ex.submit(ask_gemini, prompt_final, system, st.session_state["gemini_model"], st.session_state["temperature"]))
+        for f in as_completed(futs):
+            calls.append(f.result())
+    # Stabiliser l’ordre des onglets
+    ordered = []
+    for name in ["gpt","grok","gemini"]:
+        for r in calls:
+            if r.provider == name and r.ok:
+                ordered.append(r)
+    return ordered
+
 if run_btn:
     if not (prompt or "").strip():
         st.error("Merci d'écrire un prompt.")
@@ -697,11 +771,13 @@ if run_btn:
         final_prompt = assemble_task_prompt(prompt)
         with st.spinner("Exécution en cours…"):
             if st.session_state["debate_rounds"] and st.session_state["debate_rounds"] > 0:
+                prog = st.progress(0.0)
+                def _cb(p): prog.progress(min(1.0, max(0.0, p)))
                 final_drafts, transcript = run_debate(
                     final_prompt, system, st.session_state["debate_rounds"], st.session_state["debate_style"], st.session_state["max_chars"],
                     st.session_state["use_gpt"], st.session_state["use_grok"], st.session_state["use_gemini"],
                     st.session_state["gpt_model"], st.session_state["grok_model"], st.session_state["gemini_model"],
-                    st.session_state["temperature"]
+                    st.session_state["temperature"], progress_cb=_cb
                 )
                 for provider, draft in final_drafts.items():
                     entries.append({
@@ -711,18 +787,11 @@ if run_btn:
                         "output": draft if st.session_state["max_chars"]<=0 else draft[:15000]
                     })
             else:
-                results = []
-                if st.session_state["use_gpt"]:
-                    results.append(ask_openai_gpt(final_prompt, system, st.session_state["gpt_model"], st.session_state["temperature"]))
-                if st.session_state["use_grok"]:
-                    results.append(ask_grok_xai(final_prompt, system, st.session_state["grok_model"], st.session_state["temperature"]))
-                if st.session_state["use_gemini"]:
-                    results.append(ask_gemini(final_prompt, system, st.session_state["gemini_model"], st.session_state["temperature"]))
-                ok = [r for r in results if r.ok]
-                if not ok:
+                results = _run_selected_providers(final_prompt, system)
+                if not results:
                     st.error("Aucune réponse valide — vérifie tes clés API et tes modèles.")
                     st.stop()
-                for r in ok:
+                for r in results:
                     entries.append({
                         "provider": r.provider, "model": r.model, "latency_s": r.latency_s,
                         "ok": r.ok, "error": r.error,
