@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
-# =================== Team IA – ECOSWITCH (Web) — v3 avec 4 outils ===================
+# =================== Team IA – ECOSWITCH (Web) — v3.1 avec Décideur Auto ===================
 # Orchestrateur multi-IA (GPT/Grok/Gemini) + Débat + Juge + RAG + Exports
-# + Outils complémentaires:
-#   1) Simulation énergétique simple (bâtiment)
-#   2) Générateur de code & tests + sauvegarde + exécution optionnelle
-#   3) Analyse marché (fetch URLs -> résumé comparatif)
-#   4) PM/ Kanban léger (data editor) + génération IA de tâches
+# + Outils complémentaires (Simulation, Code & Tests, Analyse marché, PM)
+# + Décideur Auto 10/10 (multi-agents, plan-execute, XAI, fallback heuristique)
 # -----------------------------------------------------------------------------------
 import os, json, time, re, datetime, math, random, subprocess, sys, textwrap
 import streamlit as st
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Team IA – ECOSWITCH", layout="wide")
@@ -19,6 +16,7 @@ st.set_page_config(page_title="Team IA – ECOSWITCH", layout="wide")
 from openai import OpenAI
 from google import genai
 from google.genai import types as genai_types
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # RAG / PDF
 try:
@@ -382,6 +380,13 @@ def build_rag_context(query: str, kb_store: Dict, top_k: int = 5) -> Tuple[str, 
     except Exception:
         return _keyword_fallback(query, kb_store["chunks"], kb_store["meta"], top_k)
 
+def get_rag_ctx_for_prompt(user_prompt: str) -> str:
+    kb = st.session_state.get("kb_store", {})
+    if st.session_state.get("use_rag") and kb.get("chunks"):
+        ctx, _ = build_rag_context(user_prompt, kb, top_k=st.session_state.get("rag_k",5))
+        return ctx
+    return ""
+
 # ============================== Reports (MD/HTML) =============================
 def build_markdown_report(prompt: str, system: str, entries: list, scoreboard: dict,
                           meta: dict, transcript: Optional[list], weights: Dict[str,float], kb_info: dict) -> str:
@@ -446,7 +451,7 @@ table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #ddd;paddin
 
 # ========================= State (mémoire & defaults) =========================
 for k, v in {
-    "project_mem": {"brief":"", "audience":"", "voice":"", "objectives":"", "constraints":""},
+    "project_mem": {"brief":"", "audience":"", "voice":"", "objectives":"", "constraints":"", "decisions_history":[]},
     "kb_store": {},
     "prompt": "",
     "system": "Tu es un comité d'experts (ingénierie, UX, marché). Style: clair, structuré, actionnable.",
@@ -456,13 +461,14 @@ for k, v in {
     "judge_kind": "llm", "judge_provider": "gpt", "judge_model": "",
     "w_rigor": 40, "w_use": 30, "w_crea": 20, "w_risk": 10,
     "inject_mem": True, "use_rag": False, "rag_k": 5,
+    "last_decision": None, "criteria_text": "Prioriser faisabilité, coût bas, impact éco haut",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ============================ UI — En-tête commun =============================
 st.title("🛠️ Team IA – ECOSWITCH")
-st.caption("Orchestrateur multi-IA • Mémoire & RAG • Débat • Juge • Exports • + Outils (Simulation, Code, Marché, PM)")
+st.caption("Orchestrateur multi-IA • Mémoire & RAG • Débat • Juge • Exports • Outils • Décideur Auto")
 
 with st.sidebar:
     st.header("🔐 Clés API")
@@ -473,11 +479,150 @@ with st.sidebar:
     if xai_key:    os.environ["XAI_API_KEY"]    = xai_key
     if google_key: os.environ["GOOGLE_API_KEY"] = google_key
 
-# ======================== Onglet 1 — Orchestrateur IA ========================
+# ======================== Onglets ========================
 tab_orch, tab_sim, tab_code, tab_market, tab_pm = st.tabs(
     ["🧠 Orchestrateur", "🔬 Simulation énergétique", "🧪 Code & Tests", "📈 Analyse marché", "📋 PM / Kanban"]
 )
 
+# ===================== DÉCIDEUR AUTO (module) =====================
+def _provider_order() -> List[str]:
+    order = []
+    if st.session_state.get("use_grok"): order.append("grok")
+    if st.session_state.get("use_gpt"): order.append("gpt")
+    if st.session_state.get("use_gemini"): order.append("gemini")
+    if not order: order = ["gpt"]
+    return order
+
+def _llm_json_call(prompt: str, system: str, temp: float = 0.4) -> Dict[str, Any]:
+    """Essaie Grok -> GPT -> Gemini jusqu'à obtenir du JSON parsable."""
+    errs = []
+    for p in _provider_order():
+        if p == "grok":
+            r = ask_grok_xai(prompt, system, st.session_state["grok_model"], temp)
+        elif p == "gpt":
+            r = ask_openai_gpt(prompt, system, st.session_state["gpt_model"], temp)
+        else:
+            r = ask_gemini(prompt, system, st.session_state["gemini_model"], temp)
+        if r.ok and r.output:
+            txt = r.output.strip()
+            try:
+                # isoler éventuel JSON dans du texte
+                s = txt.find("{"); e = txt.rfind("}")
+                if s != -1 and e != -1 and e > s:
+                    return json.loads(txt[s:e+1])
+                return json.loads(txt)
+            except Exception as je:
+                errs.append(f"{p}: parse JSON fail ({je})")
+                continue
+        else:
+            errs.append(f"{p}: {r.error}")
+    raise RuntimeError(" / ".join(errs) or "Aucun provider n'a répondu")
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=3, max=10))
+def decideur_auto(entries: List[Dict], weights: Dict[str, float], user_criteria: str,
+                  project_mem: Dict = None, rag_ctx: str = "", max_agents: int = 3, max_loops: int = 2) -> Dict[str, Any]:
+    """
+    Agent autonome multi-étapes:
+      1) Décomposition des tâches (scoring multi-critères + choix)
+      2) Multi-agents (Technique / Business / ESG)
+      3) Boucle plan-execute si ambiguïtés
+      4) Sortie JSON: scores, choix, explication (XAI), plan[], alternatives[]
+      5) Fallback heuristique si tout échoue
+    """
+    if not entries:
+        return {"erreur": "Aucun output à analyser."}
+
+    # Contexte
+    context = {
+        "project_mem": project_mem or {},
+        "rag_extracts": rag_ctx or "",
+        "weights": weights,
+        "criteria": user_criteria
+    }
+
+    # Définition des agents
+    focuses = ["Technique/faisabilité", "Business/ROI", "Éco/ESG"]
+    focuses = focuses[:max_agents]
+
+    agent_results: Dict[str, Any] = {}
+    for i, focus in enumerate(focuses, start=1):
+        prompt_agent = (
+            "Tu es un agent décisionnel expert, objectif et complet.\n"
+            "Retourne UNIQUEMENT un JSON compact avec ces clés:\n"
+            "scores (liste d'objets par option, avec rigor,usefulness,creativity,risk,faisabilite,impact_eco,roi en 0..10),\n"
+            "choix (string: identifiant de l'option gagnante — provider name),\n"
+            "explication (string courte expliquant le pourquoi),\n"
+            "plan (liste de 5-10 étapes actionnables),\n"
+            "alternatives (liste de 2-3 options de secours),\n"
+            "raffinement_needed (bool).\n\n"
+            f"FOCUS AGENT: {focus}\n"
+            f"CONTEXTE:\n{json.dumps(context, ensure_ascii=False)}\n\n"
+            f"OPTIONS:\n{json.dumps([{'provider':e['provider'],'snippet':e['output'][:1500]} for e in entries], ensure_ascii=False)}\n\n"
+            "TÂCHES:\n"
+            "1) Scorer chaque option (rigor,usefulness,creativity,risk,faisabilite,impact_eco,roi).\n"
+            "2) Sélectionner la meilleure selon critères & poids (risk pénalise), citer 2 forces / 1 faiblesse.\n"
+            "3) Expliquer le choix (XAI court).\n"
+            "4) Proposer un plan d'action (5-10 étapes) pour exécuter la décision.\n"
+            "5) Lister 2-3 alternatives.\n"
+            "6) Si ambiguïtés ou données insuffisantes, mettre raffinement_needed=true.\n"
+        )
+        agent_results[f"agent_{i}"] = _llm_json_call(prompt_agent, "Return ONLY JSON. No markdown.", temp=0.5)
+
+    # Coordination / synthèse
+    try:
+        coord_prompt = (
+            "Tu es le coordinateur final. Tu reçois les sorties de plusieurs agents spécialisés.\n"
+            "Ta mission: fusionner et FINALISER une décision unique.\n"
+            "Retourne UNIQUEMENT un JSON compact avec clés: choix, explication, plan (5-10 étapes), alternatives (2-3 items), xai_notes (liste courte).\n\n"
+            f"AGENTS:\n{json.dumps(agent_results, ensure_ascii=False)}\n"
+        )
+        final_decision = _llm_json_call(coord_prompt, "Return ONLY JSON. No markdown.", temp=0.3)
+    except Exception:
+        # Fallback heuristique si échec
+        scores = [heuristic_scores(e['output']) for e in entries]
+        idx = scores.index(max(scores, key=lambda s: compute_total(s, weights)))
+        final_decision = {
+            "choix": entries[idx]['provider'],
+            "explication": "Fallback heuristique: meilleur score pondéré.",
+            "plan": ["1) Reprendre la sortie gagnante et la structurer", "2) Définir KPI et jalons", "3) Implémenter MVP", "4) Mesurer & itérer"],
+            "alternatives": [e['provider'] for i,e in enumerate(entries) if i != idx],
+            "xai_notes": ["Décision basée sur motifs de rigueur/utilité détectés."]
+        }
+
+    # Boucle de raffinement si demandé par agents
+    try:
+        needs_refine = any(ar.get("raffinement_needed") for ar in agent_results.values() if isinstance(ar, dict))
+    except Exception:
+        needs_refine = False
+
+    loop = 0
+    while needs_refine and loop < max_loops:
+        loop += 1
+        refine_prompt = (
+            "Certains agents signalent un besoin de raffinement. Résous ambiguïtés et améliore le plan.\n"
+            "Retourne UNIQUEMENT un JSON compact: choix, explication, plan (5-10 étapes), alternatives, xai_notes.\n\n"
+            f"AGENTS:\n{json.dumps(agent_results, ensure_ascii=False)}\n"
+            f"DECISION_ACTUELLE:\n{json.dumps(final_decision, ensure_ascii=False)}\n"
+        )
+        try:
+            final_decision = _llm_json_call(refine_prompt, "Return ONLY JSON. No markdown.", temp=0.2)
+            needs_refine = False
+        except Exception:
+            break
+
+    # Persistance dans la mémoire projet
+    if project_mem is not None:
+        hist = project_mem.get("decisions_history", [])
+        hist.append({
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "criteria": user_criteria,
+            "decision": final_decision
+        })
+        project_mem["decisions_history"] = hist
+
+    return final_decision
+
+# ======================== Onglet 1 — Orchestrateur IA ========================
 with tab_orch:
     # ------- Mémoire projet -------
     st.subheader("🧠 Mémoire projet")
@@ -661,11 +806,13 @@ with tab_orch:
         "max_chars": st.session_state["max_chars"]
     }
 
+    # ===== RUN =====
     if run_btn:
         if not (prompt or "").strip():
             st.error("Merci d'écrire un prompt.")
         else:
             final_prompt = assemble_task_prompt(prompt)
+            rag_ctx_current = get_rag_ctx_for_prompt(prompt)  # pour Décideur Auto
             with st.spinner("Exécution en cours…"):
                 if st.session_state["debate_rounds"] and st.session_state["debate_rounds"] > 0:
                     prog = st.progress(0.0)
@@ -698,17 +845,33 @@ with tab_orch:
                 provider_for_judge = st.session_state["judge_provider"] if st.session_state["judge_kind"] == "llm" else "heuristic"
                 weights_local = normalize_weights(st.session_state["w_rigor"], st.session_state["w_use"], st.session_state["w_crea"], st.session_state["w_risk"])
                 scoreboard = judge_with_provider(prompt, entries, provider_for_judge, st.session_state["judge_model"] or None, weights_local)
+
+                # --- Décideur Auto (auto-run après scoring) ---
+                try:
+                    st.session_state["last_decision"] = decideur_auto(
+                        entries, weights_local, st.session_state["criteria_text"],
+                        project_mem=st.session_state["project_mem"], rag_ctx=rag_ctx_current,
+                        max_agents=3, max_loops=2
+                    )
+                except Exception as e:
+                    st.session_state["last_decision"] = {"erreur": str(e)}
+
             st.success("Terminé !")
 
     # ------- Affichage résultats -------
     if entries:
-        tabs_out = st.tabs([f"{e['provider'].upper()}" for e in entries] + ["📊 Scores"] + (["💬 Débat"] if transcript else []) + (["📤 Export"] if True else []))
+        tabs_out = st.tabs([f"{e['provider'].upper()}" for e in entries] + ["📊 Scores"] + (["💬 Débat"] if transcript else []) + (["📤 Export"]))
+
+        # sorties modèles
         for i, e in enumerate(entries):
             with tabs_out[i]:
                 st.caption(f"Modèle: {e['model']} • Latence: {e.get('latency_s',0):.2f}s")
                 st.text_area(f"Sortie – {e['provider'].upper()}", value=e["output"], height=350, key=f"out_{i}_{e['provider']}")
+
+        # scores + DECIDEUR
         with tabs_out[len(entries)]:
             rows = []
+            weights_local = normalize_weights(st.session_state["w_rigor"], st.session_state["w_use"], st.session_state["w_crea"], st.session_state["w_risk"])
             for s in scoreboard.get("scores", []):
                 rows.append({
                     "provider": s["provider"],
@@ -716,7 +879,7 @@ with tab_orch:
                     "usefulness": round(s["usefulness"],2),
                     "creativity": round(s["creativity"],2),
                     "risk": round(s["risk"],2),
-                    "total": round(compute_total(s, weights),2)
+                    "total": round(compute_total(s, weights_local),2)
                 })
             if rows:
                 st.dataframe(rows, use_container_width=True)
@@ -724,6 +887,40 @@ with tab_orch:
                 st.markdown(f"**Classement pondéré :** {ranking}")
             st.subheader("Synthèse"); st.write(scoreboard.get("final_synthesis","(n/a)"))
             st.subheader("Plan d'action"); st.write(scoreboard.get("action_plan","(n/a)"))
+
+            st.divider()
+            st.subheader("🧠 Décideur Auto (multi-agents, XAI)")
+            st.session_state["criteria_text"] = st.text_input("Critères de décision",
+                value=st.session_state["criteria_text"], key="criteria_text_in")
+            colD1, colD2 = st.columns([1,1])
+            with colD1:
+                if st.button("🔎 Prendre une décision (recalculer)", key="decide_btn"):
+                    try:
+                        rag_ctx_current = get_rag_ctx_for_prompt(prompt)
+                        st.session_state["last_decision"] = decideur_auto(
+                            entries, weights_local, st.session_state["criteria_text"],
+                            project_mem=st.session_state["project_mem"], rag_ctx=rag_ctx_current,
+                            max_agents=3, max_loops=2
+                        )
+                    except Exception as e:
+                        st.session_state["last_decision"] = {"erreur": str(e)}
+            with colD2:
+                if st.button("🔁 Raffiner (plan-execute +1)", key="refine_btn"):
+                    try:
+                        rag_ctx_current = get_rag_ctx_for_prompt(prompt)
+                        st.session_state["last_decision"] = decideur_auto(
+                            entries, weights_local, st.session_state["criteria_text"] + " (raffiné)",
+                            project_mem=st.session_state["project_mem"], rag_ctx=rag_ctx_current,
+                            max_agents=3, max_loops=3
+                        )
+                    except Exception as e:
+                        st.session_state["last_decision"] = {"erreur": str(e)}
+
+            if st.session_state["last_decision"]:
+                with st.expander("Voir la décision détaillée", expanded=True):
+                    st.json(st.session_state["last_decision"])
+
+        # Débat
         if transcript:
             with tabs_out[len(entries)+1]:
                 st.write("Transcription du débat (extraits)")
@@ -732,6 +929,8 @@ with tab_orch:
                     for t in [x for x in transcript if x["round"] == rd]:
                         with st.expander(f"Round {rd} — {t['speaker'].upper()} ({t['model']})"):
                             st.text(t["text"])
+
+        # Export
         with tabs_out[-1]:
             kb = st.session_state.get("kb_store", {})
             kb_info = {"files": kb.get("files", []), "chunks_count": len(kb.get("chunks", []))}
@@ -740,9 +939,13 @@ with tab_orch:
                 "active": [p for p,flag in (("gpt",st.session_state["use_gpt"]),("grok",st.session_state["use_grok"]),("gemini",st.session_state["use_gemini"])) if flag],
                 "temp": st.session_state["temperature"], "debate_rounds": st.session_state["debate_rounds"], "debate_style": st.session_state["debate_style"], "max_chars": st.session_state["max_chars"]
             }
-            bundle = {"prompt": prompt, "system": system, "entries": entries, "scoreboard": scoreboard, "meta": meta_pack, "weights": weights, "kb": kb_info}
+            bundle = {"prompt": prompt, "system": system, "entries": entries, "scoreboard": scoreboard, "meta": meta_pack,
+                      "weights": normalize_weights(st.session_state["w_rigor"], st.session_state["w_use"], st.session_state["w_crea"], st.session_state["w_risk"]),
+                      "kb": kb_info}
             if transcript: bundle["transcript"] = transcript
-            md = build_markdown_report(prompt, system, entries, scoreboard, meta_pack, transcript, weights, kb_info)
+            md = build_markdown_report(prompt, system, entries, scoreboard, meta_pack, transcript,
+                                       normalize_weights(st.session_state["w_rigor"], st.session_state["w_use"], st.session_state["w_crea"], st.session_state["w_risk"]),
+                                       kb_info)
             html = build_html_report(md, title="Rapport Team IA – ECOSWITCH")
             st.download_button("⬇️ JSON (résultats)", data=json.dumps(bundle, ensure_ascii=False, indent=2),
                                file_name="results.json", mime="application/json", key="dl_json")
@@ -767,24 +970,19 @@ with tab_sim:
         ext_base = st.selectbox("Profil extérieur", ["Hiver doux (Paris)", "Hiver froid (Lille)", "Mi-saison", "Été"], index=0, key="sim_ext")
         hvac_hours = st.slider("Heures HVAC (h/jour)", 0, 24, 16, 1, key="sim_hvac")
 
-    # Profil extérieur simplifié (24h)
     if ext_base == "Hiver doux (Paris)":
         Te = np.array([2,2,1,1,1,2,3,4,6,7,8,9,9,8,7,5,4,3,3,3,3,3,3,3], dtype=float)
     elif ext_base == "Hiver froid (Lille)":
         Te = np.array([-2,-2,-3,-3,-2,-1,0,1,2,3,3,4,4,3,2,1,0,-1,-1,-2,-2,-2,-1,-1], dtype=float)
     elif ext_base == "Mi-saison":
         Te = np.array([8,8,7,7,7,8,10,12,14,15,16,17,18,17,16,14,12,10,9,9,9,9,8,8], dtype=float)
-    else:  # Été (pour clim négative -> ici on borne à 0 pour chauffage)
+    else:
         Te = np.array([18,18,17,17,17,18,20,22,24,26,28,30,31,30,29,27,25,23,22,21,20,20,19,19], dtype=float)
 
-    # Horaire consigne (simplifié : HVAC_hours en journée)
     schedule = np.array([Ti_day if 8 <= h < (8+st.session_state.get("sim_hvac",16)) else Ti_night for h in range(24)], dtype=float)
-
-    # Besoin thermique P = U * A * (Ti - Te) (W). Énergie horaire = P*1h -> Wh
-    deltaT = np.maximum(0.0, schedule - Te)  # chauffage only
-    P = U * A * deltaT  # W
-    E_Wh = P  # par heure
-    E_kWh = E_Wh / 1000.0
+    deltaT = np.maximum(0.0, schedule - Te)
+    P = U * A * deltaT
+    E_kWh = P / 1000.0
     total_kWh = float(np.sum(E_kWh))
 
     st.write(f"**Demande quotidienne estimée : {total_kWh:.1f} kWh** (chauffage)")
@@ -795,7 +993,6 @@ with tab_sim:
     plt.xlabel("Heure"); plt.ylabel("kWh/h")
     st.pyplot(fig, clear_figure=True)
 
-    # Scénario comparatif (optimisé): baisse consigne nuit +1h d’extinction
     Ti_night_opt = max(12, Ti_night-2)
     hvac_opt = max(0, st.session_state.get("sim_hvac",16)-1)
     schedule_opt = np.array([Ti_day if 8 <= h < (8+hvac_opt) else Ti_night_opt for h in range(24)], dtype=float)
@@ -832,14 +1029,13 @@ with tab_code:
         "Return ONLY code blocks for main file and tests file, with filenames on first line as comments."
     )
     if st.button("Générer le code", key="code_gen_btn"):
-        model_for_code = st.session_state["gpt_model"]  # GPT fiable pour code
+        model_for_code = st.session_state["gpt_model"]
         target_desc = f"Target framework: {framework}. Include tests: {want_tests}."
         user_prompt = f"{target_desc}\n\nSPEC:\n{spec}"
         r = ask_openai_gpt(user_prompt, sys_prompt_code, model_for_code, 0.3)
         if not r.ok:
             st.error(f"Erreur génération: {r.error}")
         else:
-            # Extraire 2 blocs de code
             txt = r.output
             blocks = re.findall(r"```(?:\w+)?\n(.*?)```", txt, flags=re.S)
             if not blocks:
@@ -852,7 +1048,6 @@ with tab_code:
                 if tests_code:
                     st.text_area("🧪 Fichier de tests", value=tests_code, height=260, key="code_tests_out")
 
-                # Sauvegarde
                 col_save = st.columns(3)
                 with col_save[0]:
                     fname_main = st.text_input("Nom fichier principal", "app_generated.py", key="code_fname_main")
@@ -903,13 +1098,11 @@ with tab_market:
                     try:
                         r = requests.get(u, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
                         soup = BeautifulSoup(r.text, "html.parser")
-                        # Texte visible simple
                         for tag in soup(["script","style","noscript"]): tag.extract()
                         text = " ".join(soup.get_text(separator=" ").split())
                         pages.append({"url": u, "text": text[:30000]})
                     except Exception as e:
                         pages.append({"url": u, "text": f"[ERREUR FETCH: {e}]"})
-                # Compose prompt
                 corpus = "\n\n".join([f"URL: {p['url']}\nTEXT:\n{p['text']}" for p in pages])
                 sys_market = "You are a B2B market analyst. Return concise, actionable, structured outputs with tables in Markdown."
                 usr_market = f"Focus: {query_focus}\nCompare les URLs suivantes. Livrables: 1) tableau Features x Produits; 2) pricing (si dispo); 3) ICP/segments; 4) SWOT synthétique; 5) 3 opportunités pour EcoSwitch.\n\n{corpus}"
@@ -924,7 +1117,6 @@ with tab_pm:
     st.header("📋 Project Management (Kanban léger)")
     st.caption("Édite les tâches, génère une roadmap via IA, exporte/importe en JSON.")
 
-    # DataFrame initial
     if "pm_df" not in st.session_state:
         st.session_state["pm_df"] = pd.DataFrame([
             {"id":1,"title":"Setup orchestrateur","owner":"Saadi","status":"Done","estimate_days":1,"due_date":""},
@@ -947,9 +1139,7 @@ with tab_pm:
             sys_pm = "You are a pragmatic product manager. Return tasks as JSON list with fields: id, title, owner, status, estimate_days, due_date (YYYY-MM-DD or empty). Keep 8-15 tasks."
             r = ask_openai_gpt(pm_goal, sys_pm, st.session_state["gpt_model"], 0.5)
             if r.ok:
-                # Chercher JSON
                 try:
-                    # extraire bloc JSON si nécessaire
                     m = re.search(r"(\[.*\])", r.output, flags=re.S)
                     data = json.loads(m.group(1) if m else r.output)
                     df = pd.DataFrame(data)
