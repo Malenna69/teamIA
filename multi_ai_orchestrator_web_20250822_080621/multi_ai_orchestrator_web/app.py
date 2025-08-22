@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 EcoSwitch — Team IA Orchestrator (Streamlit)
-Version full intégrée (2025-08-22)
+Version full intégrée (2025-08-22) + PATCH mémoire EcoSwitch + Directeur Assistant
 
 Inclus :
 - Correctif IndexError du décideur (clamp + fallback heuristique)
@@ -10,6 +10,8 @@ Inclus :
 - Auto-routing du département (Orchestrateur & Chat)
 - Calibrateur de prompt par département (Orchestrateur & Chat)
 - Sélection correcte du juge (gpt/grok/gemini vs heuristic)
+- ✅ PATCH: Injection automatique contexte EcoSwitch (orchestrateur + chat)
+- ✅ PATCH: Onglet “🧭 Directeur Assistant” (résumé exécutif)
 """
 
 import os, json, time, asyncio, re, io, datetime, unicodedata
@@ -72,6 +74,19 @@ class ProviderResult:
     latency_s: float
     ok: bool
     error: Optional[str] = None
+
+# ---------- Contexte EcoSwitch (injecté partout) ----------
+ECO_CONTEXT = """Mission: Prouver localement, chiffrer et expliquer la meilleure solution de chauffage (PAC seule, PAC hybride/relevé, ou chaudière conservée) pour maximiser l’épargne et réduire le CO₂, sans dogme ni cloud.
+Produit: Assistant local (edge) ESP32-S3 + DS18B20/BME280, écran e-ink 2.13", LED (🟢/🔵/🟠), QR chiffré, serveur local.
+Moteur: Modèle thermique dynamique (ISO 52016-1), COP PAC (EN 14825, BDPAC), rendement chaudière (EN 15316), arbitrage coûts élec/gaz (HP/HC, Tempo), hystérésis, dimensionnement EN 12831, facteur EP dynamique (EN 17423).
+Différenciation: 100% local & RGPD-by-design, verdict neutre, UX claire LED/écran, preuves chiffrées (coût/ROI/CO₂).
+KPIs: Économies €/an, CO₂ évité, % verdicts hybrides, conversion installateur, délai décision, NPS.
+"""
+def inject_eco_context(user_prompt: str, rag_ctx: str = "") -> str:
+    parts = [f"Contexte EcoSwitch:\n{ECO_CONTEXT}", f"Tâche:\n{user_prompt.strip()}"]
+    if rag_ctx:
+        parts.append("[Contexte documents]\n" + _trim(rag_ctx, 3500))
+    return "\n\n".join(parts)
 
 # ========================= Presets “Départements” =========================
 DEPARTMENTS: Dict[str, Dict[str, Any]] = {
@@ -350,7 +365,7 @@ def heuristic_scores(text: str):
     rigor = 2.0*len(re.findall(r"\b(en|iso|din|norme|source|ref|réf)\b", t.lower())) \
           + 1.0*len(re.findall(r"\d+(\.\d+)?", t)) \
           + 1.5*len(re.findall(r"^\d+[\.\)]", t, flags=re.M))
-    usefulness = 1.5*len(re.findall(r"\b(\- |\* )", t)) \
+    usefulness = 1.5*len(re.findall(r"(?m)^\s*[\-\*]\s+", t)) \
                + 2.0*len(re.findall(r"\b(étape|step|plan|roadmap|livrable|deadline)\b", t.lower())) \
                + 1.0*len(re.findall(r"\b(implémente|construis|déploie|mesure|teste|valide)\b", t.lower()))
     creativity = min(10.0, unique / max(1, len(words)) * 20.0)
@@ -867,11 +882,11 @@ if mode == "Orchestrateur":
             try: rag_ctx = search_kb(prompt, st.session_state["kb"], topk=RAG_TOPK)
             except Exception as e: st.warning(f"RAG désactivé (erreur): {e}")
 
-        # Prompt à envoyer (calibré ou brut)
+        # Prompt à envoyer (calibré + mémoire EcoSwitch)
         if st.session_state.get("prompt_calib", False):
-            full_prompt = build_calibrated_prompt(prompt, dep_key, rag_ctx=rag_ctx)
+            full_prompt = inject_eco_context(build_calibrated_prompt(prompt, dep_key, rag_ctx=rag_ctx), rag_ctx="")
         else:
-            full_prompt = prompt if not rag_ctx else f"{prompt}\n\n[Contexte documents]\n{_trim(rag_ctx, 3500)}"
+            full_prompt = inject_eco_context(prompt, rag_ctx=rag_ctx)
 
         with st.spinner("Appels LLM en parallèle…"):
             async def run_all():
@@ -952,14 +967,32 @@ if mode == "Orchestrateur":
 
         st.success("Terminé ! ✅")
 
-        tab_labels = [f"{e['provider'].upper()}" for e in entries] + ["📊 Scores", "🧠 Décideur"] + (["💬 Débat"] if transcript else [])
+        # ---------- Directeur Assistant (résumé exécutif) ----------
+        def _director_synthesis(entries_list: List[Dict[str,Any]], task_text: str) -> Dict[str,Any]:
+            if not entries_list:
+                return {"tl;dr":"(aucune sortie)","decisions":[],"plan":[],"risques":[],"citations":[]}
+            def score(txt: str) -> int:
+                return len(re.findall(r"(?m)^\s*[\-\*\d]+\.", txt)) + len(re.findall(r"\b(plan|étape|objectif|risque|mesure)\b", txt.lower()))
+            best = max(entries_list, key=lambda e: score(e["output"] or ""))
+            bullets = re.findall(r"(?m)^\s*(?:[\-\*]|\d+[\.\)])\s+(.*)", best["output"])[:8]
+            return {
+                "tl;dr": (best["output"].split("\n")[0][:300] if best["output"] else "—"),
+                "decisions": bullets[:3],
+                "plan": bullets[:6],
+                "risques": ["Ambiguïté → clarifier", "Complexité → POC timebox", "Dépendances → checklist"],
+                "citations": [{"provider": best["provider"], "excerpt": (best["output"][:220] + ("…" if len(best["output"])>220 else ""))}]
+            }
+
+        tab_labels = [f"{e['provider'].upper()}" for e in entries] + ["📊 Scores", "🧠 Décideur", "🧭 Directeur Assistant"] + (["💬 Débat"] if transcript else [])
         tabs = st.tabs(tab_labels)
 
+        # Réponses par modèle
         for i, e in enumerate(entries):
             with tabs[i]:
                 st.caption(f"Modèle: {e['model']} • Latence: {e['latency_s']:.2f}s")
                 st.text_area("Sortie", value=e["output"], height=350, key=f"out_{e['provider']}")
 
+        # Scores
         with tabs[len(entries)]:
             rows = []
             for s in scoreboard.get("scores", []):
@@ -976,6 +1009,7 @@ if mode == "Orchestrateur":
             st.subheader("Plan d'action")
             st.write(scoreboard.get("action_plan","(n/a)"))
 
+        # Décideur
         with tabs[len(entries)+1]:
             if not decision:
                 st.info("Décideur non disponible pour cette exécution.")
@@ -994,6 +1028,21 @@ if mode == "Orchestrateur":
                 with st.expander("Extrait du choix"):
                     st.code(decision.get("choix_excerpt",""))
 
+        # Directeur Assistant
+        with tabs[len(entries)+2]:
+            director = _director_synthesis(entries, prompt)
+            st.markdown(f"**TL;DR** : {director.get('tl;dr','')}")
+            st.markdown("**Décisions proposées** :")
+            for d in director.get("decisions", []): st.markdown(f"- {d}")
+            st.markdown("**Plan d’action** :")
+            for i, step in enumerate(director.get("plan", []), 1): st.markdown(f"{i}. {step}")
+            st.markdown("**Risques & parades** :")
+            for r in director.get("risques", []): st.markdown(f"- {r}")
+            with st.expander("Citations"):
+                for c in director.get("citations", []):
+                    st.write(f"{c.get('provider','?')} : {c.get('excerpt','')}")
+
+        # Débat
         if transcript:
             with tabs[-1]:
                 st.write("Transcription du débat (extraits)")
@@ -1080,15 +1129,17 @@ if mode == "Chat":
             st.caption(f"Département auto (chat) : {DEPARTMENTS[dep_key_chat]['label']}")
         weights, chat_system, temp_chat, _ = _apply_department(dep_key_chat, chat_system, st.session_state.get("p_temp",0.6), 0)
 
-        # Calibrage éventuel du prompt de chat
+        # Calibrage éventuel du prompt de chat + mémoire EcoSwitch
         if st.session_state.get("prompt_calib_chat", False):
-            chat_prompt = build_calibrated_prompt(user_msg, dep_key_chat, rag_ctx=rag_ctx)
+            user_block = build_calibrated_prompt(user_msg, dep_key_chat, rag_ctx=rag_ctx)
+            chat_prompt = inject_eco_context(user_block, rag_ctx="")
         else:
-            chat_prompt = (
+            user_block = (
                 f"{convo}\n\nMessage actuel:\n{user_msg}\n\n"
                 + (f"[Contexte docs]\n{_trim(rag_ctx, 2500)}\n\n" if rag_ctx else "")
-                + "Réponds à l'utilisateur en intégrant le contexte si pertinent."
+                + "Réponds en tenant compte strictement du contexte EcoSwitch."
             )
+            chat_prompt = inject_eco_context(user_block, rag_ctx="")
 
         # Appels providers en parallèle
         async def chat_call():
