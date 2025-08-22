@@ -2,4 +2,4 @@ streamlit>=1.35.0
 openai>=1.40.0
 google-genai>=0.3.0
 python-dotenv>=1.0.1
-pypdf>=4.0.0     # (optionnel, seulement si tu veux parser les PDF)
+pypdf>=4.0.0        # optionnel (PDF pour RAG)
