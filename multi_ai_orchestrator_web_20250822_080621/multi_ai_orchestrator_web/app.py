@@ -126,7 +126,7 @@ def judge_with_provider(task: str, entries: list, provider: str, judge_model: Op
         totals = [(s["provider"], 0.40*s["rigor"] + 0.30*s["usefulness"] + 0.20*s["creativity"] + 0.10*(10 - s["risk"])) for s in scores]
         ranking = [p for p,_ in sorted(totals, key=lambda x: x[1], reverse=True)]
         return {"scores": scores, "weighted_ranking": ranking,
-                "final_synthesis": "Synthèse non‑LLM: utiliser le top‑rank comme base et fusionner manuellement.",
+                "final_synthesis": "Synthèse non-LLM: utiliser le top-rank comme base et fusionner manuellement.",
                 "action_plan": "- Prendre les points clés du meilleur score\n- Ajouter 2 actions du 2e meilleur\n- Lister les risques signalés"}
 
     bundle = {"task": task, "entries": entries, "weights": WEIGHTS}
@@ -180,7 +180,7 @@ def judge_with_provider(task: str, entries: list, provider: str, judge_model: Op
 def role_system(base: Optional[str]) -> str:
     base = base or "You are a respectful, concise expert."
     extra = (
-        " You are in a multi‑agent debate. "
+        " You are in a multi-agent debate. "
         "Each round, first write a brief CRITIQUE (<=120 words) of others' drafts, "
         "then produce an improved REVISION. "
         "Format:\nCRITIQUE: ...\nREVISION:\n..."
@@ -196,7 +196,7 @@ def prompt_for_round(task: str, self_name: str, drafts: Dict[str, str], round_id
     blocks.append(
         "Instructions:\n"
         "- Provide CRITIQUE (succinct, concrete) on gaps, errors, structure.\n"
-        "- Then provide a clear, improved REVISION (self‑contained)."
+        "- Then provide a clear, improved REVISION (self-contained)."
     )
     return "\n".join(blocks)
 
@@ -236,10 +236,10 @@ def run_debate(task: str, system: Optional[str], rounds: int,
     return drafts, transcript
 
 # =============== UI ===============
-st.set_page_config(page_title="Multi‑IA Orchestrator (Web)", layout="wide")
+st.set_page_config(page_title="Multi-IA Orchestrator (Web)", layout="wide")
 
-st.title("🤝 Multi‑IA Orchestrator — Web")
-st.caption("Grok + GPT + Gemini • brainstorming, débat multi‑tours, évaluation pondérée")
+st.title("🤝 Multi-IA Orchestrator — Web")
+st.caption("Grok + GPT + Gemini • brainstorming, débat multi-tours, évaluation pondérée")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -337,7 +337,13 @@ if run_btn:
         for i, e in enumerate(entries):
             with tabs[i]:
                 st.caption(f"Modèle: {e['model']} • Latence: {e['latency_s']:.2f}s")
-                st.text_area("Sortie", value=e["output"], height=350)
+                # 🔧 Clef unique pour éviter StreamlitDuplicateElementId
+                st.text_area(
+                    f"Sortie – {e['provider'].upper()}",
+                    value=e["output"],
+                    height=350,
+                    key=f"out_{i}_{e['provider']}"
+                )
 
         with tabs[len(entries)]:
             # Score table
@@ -360,12 +366,17 @@ if run_btn:
                 st.write("Transcription du débat (extraits)")
                 for rd in sorted(set(t["round"] for t in transcript)):
                     st.markdown(f"#### Round {rd}")
-                    for t in [x for x in transcript if x["round"] == rd]:
-                        with st.expander(f"{t['speaker'].upper()} ({t['model']})"):
+                    for idx, t in enumerate([x for x in transcript if x["round"] == rd]):
+                        with st.expander(f"Round {rd} — {t['speaker'].upper()} ({t['model']})"):
                             st.text(t["text"])
 
         if save_btn:
             # provide downloadable json bundle
             bundle = {"prompt": prompt, "system": system, "entries": entries, "scoreboard": scoreboard}
             if transcript: bundle["transcript"] = transcript
-            st.download_button("⬇️ Télécharger les résultats (JSON)", data=json.dumps(bundle, ensure_ascii=False, indent=2), file_name="results.json", mime="application/json")
+            st.download_button(
+                "⬇️ Télécharger les résultats (JSON)",
+                data=json.dumps(bundle, ensure_ascii=False, indent=2),
+                file_name="results.json",
+                mime="application/json"
+            )
