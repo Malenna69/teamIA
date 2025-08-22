@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-import os, json, time
+import os, json, time, re
 import streamlit as st
 
-# Providers
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict
 
 # =============== Low-level provider calls ===============
 from openai import OpenAI
@@ -14,7 +13,6 @@ from google.genai import types as genai_types
 TIMEOUT_S = 60
 
 def _get_key(name: str) -> Optional[str]:
-    # priorities: st.secrets -> env -> text input
     if name in st.secrets:
         return st.secrets[name]
     return os.getenv(name)
@@ -98,7 +96,6 @@ def ask_gemini(prompt: str, system: Optional[str], model: str, temp: Optional[fl
         return ProviderResult("gemini", model, "", time.time()-t0, False, str(e))
 
 # =============== Heuristic scoring ===============
-import re
 def heuristic_scores(text: str):
     t = text or ""
     words = re.findall(r"\w+", t.lower())
@@ -139,7 +136,7 @@ def judge_with_provider(task: str, entries: list, provider: str, judge_model: Op
         f"DATA:\n{json.dumps(bundle, ensure_ascii=False)}"
     )
 
-    if provider == "gpt" or provider == "grok":
+    if provider in ("gpt","grok"):
         base_url = "https://api.x.ai/v1" if provider=="grok" else None
         api_key = _get_key("XAI_API_KEY") if provider=="grok" else _get_key("OPENAI_API_KEY")
         if not api_key: raise RuntimeError("Clé API manquante pour le juge sélectionné.")
@@ -244,7 +241,6 @@ st.caption("Grok + GPT + Gemini • brainstorming, débat multi-tours, évaluati
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    # API keys
     st.subheader("Clés API")
     openai_key = st.text_input("OPENAI_API_KEY", value=_get_key("OPENAI_API_KEY") or "", type="password")
     xai_key = st.text_input("XAI_API_KEY", value=_get_key("XAI_API_KEY") or "", type="password")
@@ -294,7 +290,6 @@ if run_btn:
                     gpt_model, grok_model, gemini_model,
                     temp
                 )
-                # Convert drafts to entries for judging
                 entries = []
                 for provider, draft in final_drafts.items():
                     entries.append({
@@ -306,7 +301,6 @@ if run_btn:
                         "output": draft[:15000]
                     })
             else:
-                # one-shot parallel: sequential in UI for simplicity
                 entries = []
                 results = []
                 if use_gpt:
@@ -326,9 +320,21 @@ if run_btn:
                     })
                 transcript = None
 
-            # judge
+            # judge (LLM ou heuristique)
             provider_for_judge = judge_provider if judge_kind == "llm" else "heuristic"
             scoreboard = judge_with_provider(prompt, entries, provider_for_judge, judge_model or None)
+
+            # 🛟 Fallback si le juge ne renvoie pas "scores"
+            if not scoreboard.get("scores"):
+                scores = []
+                for e in entries:
+                    s = heuristic_scores(e["output"]); s["provider"] = e["provider"]; scores.append(s)
+                totals = [(s["provider"], 0.40*s["rigor"] + 0.30*s["usefulness"] + 0.20*s["creativity"] + 0.10*(10 - s["risk"])) for s in scores]
+                ranking = [p for p,_ in sorted(totals, key=lambda x: x[1], reverse=True)]
+                scoreboard["scores"] = scores
+                scoreboard.setdefault("weighted_ranking", ranking)
+                scoreboard.setdefault("final_synthesis", "(Fallback) Tableau généré en heuristique.")
+                scoreboard.setdefault("action_plan", "- Prendre les points clés du meilleur score\n- Ajouter 2 actions du 2e meilleur\n- Lister les risques signalés")
 
         # Display results
         st.success("Terminé !")
@@ -337,7 +343,6 @@ if run_btn:
         for i, e in enumerate(entries):
             with tabs[i]:
                 st.caption(f"Modèle: {e['model']} • Latence: {e['latency_s']:.2f}s")
-                # 🔧 Clef unique pour éviter StreamlitDuplicateElementId
                 st.text_area(
                     f"Sortie – {e['provider'].upper()}",
                     value=e["output"],
@@ -346,7 +351,6 @@ if run_btn:
                 )
 
         with tabs[len(entries)]:
-            # Score table
             import pandas as pd
             rows = []
             for s in scoreboard.get("scores", []):
@@ -361,19 +365,19 @@ if run_btn:
             st.subheader("Plan d'action")
             st.write(scoreboard.get("action_plan","(n/a)"))
 
-        if transcript:
+        if 'transcript' in locals() and transcript:
             with tabs[-1]:
                 st.write("Transcription du débat (extraits)")
                 for rd in sorted(set(t["round"] for t in transcript)):
                     st.markdown(f"#### Round {rd}")
-                    for idx, t in enumerate([x for x in transcript if x["round"] == rd]):
+                    for t in [x for x in transcript if x["round"] == rd]:
                         with st.expander(f"Round {rd} — {t['speaker'].upper()} ({t['model']})"):
                             st.text(t["text"])
 
         if save_btn:
-            # provide downloadable json bundle
             bundle = {"prompt": prompt, "system": system, "entries": entries, "scoreboard": scoreboard}
-            if transcript: bundle["transcript"] = transcript
+            if 'transcript' in locals() and transcript:
+                bundle["transcript"] = transcript
             st.download_button(
                 "⬇️ Télécharger les résultats (JSON)",
                 data=json.dumps(bundle, ensure_ascii=False, indent=2),
